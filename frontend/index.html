@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leave Management</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Login -->
+  <section id="login-view" class="login" hidden>
+    <form id="login-form" class="login-card" novalidate>
+      <h1>Leave Management</h1>
+      <p class="muted">Sign in with your company account.</p>
+      <label for="login-email">Email</label>
+      <input id="login-email" type="email" autocomplete="username" required>
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <div id="new-password-block" hidden>
+        <label for="login-new-password">Choose a new password</label>
+        <input id="login-new-password" type="password" autocomplete="new-password">
+        <p class="hint">At least 8 characters with upper case, lower case and a number.</p>
+      </div>
+      <p id="login-error" class="error" role="alert"></p>
+      <button type="submit" class="btn primary" id="login-button">Sign in</button>
+    </form>
+  </section>
+
+  <!-- App -->
+  <div id="app-view" hidden>
+    <header class="topbar">
+      <div class="brand">Leave Management</div>
+      <nav class="tabs" id="tabs">
+        <button class="tab" data-view="mine">My leave</button>
+        <button class="tab" data-view="approvals" data-role="approver">Approvals <span id="pending-count" class="count" hidden></span></button>
+        <button class="tab" data-view="calendar" data-role="approver">Team calendar</button>
+        <button class="tab" data-view="reports" data-role="approver">Reports</button>
+      </nav>
+      <div class="user">
+        <span id="user-name"></span>
+        <span id="user-roles" class="roles"></span>
+        <button class="btn link" id="logout">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- Employee view -->
+      <section id="view-mine" class="view">
+        <h2>Leave balance <span id="balance-year" class="muted"></span></h2>
+        <div id="balances" class="balance-grid"></div>
+
+        <div class="two-col">
+          <form id="apply-form" class="panel" novalidate>
+            <h2>Apply for leave</h2>
+            <label for="leave-type">Leave type</label>
+            <select id="leave-type" required></select>
+            <div class="row">
+              <div>
+                <label for="start-date">From</label>
+                <input id="start-date" type="date" required>
+              </div>
+              <div>
+                <label for="end-date">To</label>
+                <input id="end-date" type="date" required>
+              </div>
+            </div>
+            <p id="day-estimate" class="hint"></p>
+            <label for="reason">Reason</label>
+            <textarea id="reason" maxlength="500" rows="3" placeholder="Optional"></textarea>
+            <p id="apply-message" class="message" role="status"></p>
+            <button type="submit" class="btn primary" id="apply-button">Submit request</button>
+          </form>
+
+          <div class="panel rules">
+            <h2>Leave rules</h2>
+            <div id="rules"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>My leave history</h2>
+            <button class="btn ghost" id="refresh-history">Refresh</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Request</th><th>Type</th><th>Dates</th><th>Days</th><th>Status</th><th>Details</th></tr></thead>
+              <tbody id="history"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Approvals -->
+      <section id="view-approvals" class="view" hidden>
+        <div class="panel-head">
+          <h2>Pending approvals</h2>
+          <button class="btn ghost" id="refresh-approvals">Refresh</button>
+        </div>
+        <div id="approvals"></div>
+      </section>
+
+      <!-- Calendar -->
+      <section id="view-calendar" class="view" hidden>
+        <div class="panel-head">
+          <h2 id="cal-title">Team calendar</h2>
+          <div class="cal-nav">
+            <button class="btn ghost" id="cal-prev" aria-label="Previous month">&larr;</button>
+            <button class="btn ghost" id="cal-today">This month</button>
+            <button class="btn ghost" id="cal-next" aria-label="Next month">&rarr;</button>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="dot approved"></i>Approved</span>
+          <span><i class="dot pending"></i>Pending</span>
+          <span><i class="dot holiday"></i>Holiday</span>
+        </div>
+        <div id="calendar" class="calendar"></div>
+        <div class="panel">
+          <h2>On leave today</h2>
+          <div id="today-list"></div>
+        </div>
+      </section>
+
+      <!-- Reports -->
+      <section id="view-reports" class="view" hidden>
+        <form id="report-form" class="panel narrow" novalidate>
+          <h2>Download leave report</h2>
+          <p class="muted">CSV of all leave requests (any status) that overlap the date range. Managers get their team; HR gets everyone.</p>
+          <div class="row">
+            <div>
+              <label for="report-from">From</label>
+              <input id="report-from" type="date" required>
+            </div>
+            <div>
+              <label for="report-to">To</label>
+              <input id="report-to" type="date" required>
+            </div>
+          </div>
+          <p id="report-message" class="message" role="status"></p>
+          <button class="btn primary" id="report-button" type="submit">Download CSV</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

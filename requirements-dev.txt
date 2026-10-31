@@ -1,0 +1,4 @@
+# For running the tests and the scripts on your laptop (not needed in Lambda)
+boto3>=1.34
+pytest>=8
+PyYAML>=6

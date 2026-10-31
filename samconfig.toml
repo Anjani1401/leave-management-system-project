@@ -1,0 +1,22 @@
+# Saved settings for `sam deploy`. Change SenderEmail to your SES-verified address.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "leave-mgmt"
+
+[default.deploy.parameters]
+region = "ap-south-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+parameter_overrides = "SenderEmail=\"you@example.com\" ApprovalTimeoutSeconds=\"172800\""
+
+# Demo profile: approvers get only 2 minutes, so the 48-hour inaction case can be
+# shown live.  Deploy with:  sam deploy --config-env demo
+[demo.deploy.parameters]
+stack_name = "leave-mgmt"
+region = "ap-south-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+parameter_overrides = "SenderEmail=\"you@example.com\" ApprovalTimeoutSeconds=\"120\""

@@ -1,0 +1,537 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Leave Management System - employees apply for leave, managers (and HR Admin for
+  long leave) approve through a Step Functions workflow, quotas are enforced from a
+  configuration table, and HR gets a live absence calendar.
+
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: Verified SES email address that sends all notifications.
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be a valid email address (verify it in SES first).
+  ApprovalTimeoutSeconds:
+    Type: Number
+    Default: 172800
+    MinValue: 60
+    Description: How long an approver has to respond (172800 = 48 hours). Use 120 for demos.
+  StageName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-zA-Z0-9_]+$"
+  ApproverEmailViaSes:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Also send approvers a formatted SES email (SNS is always used).
+  TzOffsetMinutes:
+    Type: Number
+    Default: 330
+    Description: Company time zone offset from UTC in minutes (330 = IST).
+
+Globals:
+  Api:
+    OpenApiVersion: "3.0.1"
+  Function:
+    Runtime: python3.12
+    CodeUri: backend/src/
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        CONFIG_TABLE: !Ref LeaveConfigTable
+        BALANCES_TABLE: !Ref LeaveBalancesTable
+        REQUESTS_TABLE: !Ref LeaveRequestsTable
+        EMPLOYEES_TABLE: !Ref EmployeesTable
+        SENDER_EMAIL: !Ref SenderEmail
+        APPROVAL_TIMEOUT_SECONDS: !Ref ApprovalTimeoutSeconds
+        TZ_OFFSET_MINUTES: !Ref TzOffsetMinutes
+
+Resources:
+  # ------------------------------------------------------------------ DynamoDB
+  LeaveConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-leave_config"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: leave_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: leave_type
+          KeyType: HASH
+
+  LeaveBalancesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-leave_balances"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: employee_id
+          AttributeType: S
+        - AttributeName: leave_type_year
+          AttributeType: S
+      KeySchema:
+        - AttributeName: employee_id
+          KeyType: HASH
+        - AttributeName: leave_type_year
+          KeyType: RANGE
+
+  LeaveRequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-leave_requests"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: employee_id
+          AttributeType: S
+        - AttributeName: request_id
+          AttributeType: S
+        - AttributeName: manager_id
+          AttributeType: S
+        - AttributeName: status_created
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: start_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: employee_id
+          KeyType: HASH
+        - AttributeName: request_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: manager-status-index
+          KeySchema:
+            - AttributeName: manager_id
+              KeyType: HASH
+            - AttributeName: status_created
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-start-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: start_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  EmployeesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-employees"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: employee_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: employee_id
+          KeyType: HASH
+
+  # ------------------------------------------------------------------ Cognito
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: employee_id
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "1"
+            MaxLength: "64"
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-web"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      ReadAttributes: [email, email_verified, name, custom:employee_id]
+      # Users can't change their own employee_id (only admins/seed script can).
+      WriteAttributes: [email, name]
+
+  EmployeeGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: Employee
+      Description: Can apply for leave and see own balances and history
+  ManagerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: Manager
+      Description: Approves direct reports' leave, sees team calendar and reports
+  HRAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: HRAdmin
+      Description: Approves long/escalated leave, sees company calendar and reports
+
+  # ------------------------------------------------------------------ Messaging & secrets
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-approval-notifications"
+      DisplayName: Leave Approvals
+
+  SigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/approval-link-signing-key"
+      Description: HMAC key that signs the approve/reject links in approver emails
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # ------------------------------------------------------------------ S3
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadForStaticWebsite
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReports
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # ------------------------------------------------------------------ APIs
+  # Main API: every route needs a Cognito login (ID token in Authorization header).
+  LeaveApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref StageName
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+
+  # Separate public API for the email approve/reject links (secured by signed tokens).
+  # Kept separate so NotifyApprover can reference its URL without a circular dependency.
+  DecisionApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-decision-links"
+      StageName: !Ref StageName
+
+  # ------------------------------------------------------------------ Lambda functions
+  SubmitLeaveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: POST /leaves - validates, checks balance and overlaps, starts the approval workflow
+      Handler: handlers.submit.handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref LeaveApprovalStateMachine
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LeaveConfigTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveBalancesTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt LeaveApprovalStateMachine.Name
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: "*"
+      Events:
+        Submit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LeaveApi
+            Path: /leaves
+            Method: post
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Read endpoints, in-app approvals, calendar and CSV reports
+      Handler: handlers.api.handler
+      Timeout: 29
+      Environment:
+        Variables:
+          REPORTS_BUCKET: !Ref ReportsBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LeaveConfigTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveBalancesTable
+        - S3CrudPolicy:
+            BucketName: !Ref ReportsBucket
+        - Statement:
+            - Effect: Allow
+              Action: [states:SendTaskSuccess]
+              Resource: "*"
+      Events:
+        Me:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /me, Method: get}
+        LeaveTypes:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /config/leave-types, Method: get}
+        Balances:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /me/balances, Method: get}
+        MyLeaves:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /me/leaves, Method: get}
+        Pending:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /approvals/pending, Method: get}
+        Decide:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: "/approvals/{employee_id}/{request_id}", Method: post}
+        Calendar:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /calendar, Method: get}
+        Report:
+          Type: Api
+          Properties: {RestApiId: !Ref LeaveApi, Path: /reports/leaves, Method: get}
+
+  DecisionLinkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: GET/POST /decision - approve/reject links from approver emails (signed token)
+      Handler: handlers.decision_link.handler
+      Environment:
+        Variables:
+          SIGNING_SECRET_ARN: !Ref SigningSecret
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SigningSecret
+        - Statement:
+            - Effect: Allow
+              Action: [states:SendTaskSuccess]
+              Resource: "*"
+      Events:
+        ShowConfirmation:
+          Type: Api
+          Properties: {RestApiId: !Ref DecisionApi, Path: /decision, Method: get}
+        Confirm:
+          Type: Api
+          Properties: {RestApiId: !Ref DecisionApi, Path: /decision, Method: post}
+
+  NotifyApproverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Step Functions task - emails the approver signed links and stores the task token
+      Handler: handlers.notify_approver.handler
+      Environment:
+        Variables:
+          SIGNING_SECRET_ARN: !Ref SigningSecret
+          APPROVAL_TOPIC_ARN: !Ref ApprovalTopic
+          DECISION_BASE_URL: !Sub "https://${DecisionApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+          APPROVER_EMAIL_VIA_SES: !Ref ApproverEmailViaSes
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref SigningSecret
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ApprovalTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: "*"
+
+  FinalApproveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Step Functions task - atomically approves the request and deducts the balance
+      Handler: handlers.final_approve.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LeaveConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveBalancesTable
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: "*"
+
+  RejectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Step Functions task - marks the request rejected and emails the employee
+      Handler: handlers.reject.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: "*"
+
+  WeeklyBalanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Weekly - credits carry-forward balances and emails balance summaries
+      Handler: handlers.weekly_balance.handler
+      Timeout: 300
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LeaveConfigTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref EmployeesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref LeaveRequestsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaveBalancesTable
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, ses:SendRawEmail]
+              Resource: "*"
+      Events:
+        WeeklySchedule:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub "${AWS::StackName}-weekly-balance"
+            Description: Monday 09:00 IST - carry-forward and balance summary emails
+            ScheduleExpression: "cron(0 9 ? * MON *)"
+            ScheduleExpressionTimezone: Asia/Kolkata
+            Input: "{}"
+
+  # ------------------------------------------------------------------ Step Functions
+  LeaveApprovalStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-leave-approval"
+      Type: STANDARD
+      DefinitionUri: statemachine/leave_approval.asl.json
+      DefinitionSubstitutions:
+        NotifyApproverFunctionArn: !GetAtt NotifyApproverFunction.Arn
+        FinalApproveFunctionArn: !GetAtt FinalApproveFunction.Arn
+        RejectFunctionArn: !GetAtt RejectFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref NotifyApproverFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FinalApproveFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RejectFunction
+
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  ApiUrl:
+    Description: Base URL of the main (Cognito-protected) API
+    Value: !Sub "https://${LeaveApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  DecisionLinkUrl:
+    Description: Base URL used in approver email links
+    Value: !Sub "https://${DecisionApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/decision"
+  WebsiteUrl:
+    Description: Open this in a browser after running scripts/deploy_frontend.py
+    Value: !GetAtt FrontendBucket.WebsiteURL
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  ReportsBucketName:
+    Value: !Ref ReportsBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  LeaveConfigTableName:
+    Value: !Ref LeaveConfigTable
+  LeaveBalancesTableName:
+    Value: !Ref LeaveBalancesTable
+  LeaveRequestsTableName:
+    Value: !Ref LeaveRequestsTable
+  EmployeesTableName:
+    Value: !Ref EmployeesTable
+  ApprovalTopicArn:
+    Value: !Ref ApprovalTopic
+  StateMachineArn:
+    Value: !Ref LeaveApprovalStateMachine
+  WeeklyBalanceFunctionName:
+    Value: !Ref WeeklyBalanceFunction

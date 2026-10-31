@@ -1,0 +1,516 @@
+{
+  "Comment": "Leave approval workflow: manager approval, then HR Admin approval for leave longer than the HR threshold. Manager inaction escalates to HR; HR inaction rejects the request. Balance is deducted only in FinalApprove.",
+  "StartAt": "NotifyManager",
+  "States": {
+    "NotifyManager": {
+      "Type": "Task",
+      "Comment": "Email the manager signed approve/reject links, then wait for the decision (task token).",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${NotifyApproverFunctionArn}",
+        "Payload": {
+          "taskToken.$": "$$.Task.Token",
+          "request.$": "$.request",
+          "level": "MANAGER",
+          "timeout_seconds.$": "$.config.approval_timeout_seconds"
+        }
+      },
+      "TimeoutSecondsPath": "$.config.approval_timeout_seconds",
+      "ResultPath": "$.manager_decision",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.error",
+          "Next": "EscalateToHR"
+        },
+        {
+          "ErrorEquals": [
+            "RequestNotPendingError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RequestNoLongerPending"
+        },
+        {
+          "ErrorEquals": [
+            "NoApproverError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectNoApprover"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectSystemError"
+        }
+      ],
+      "Next": "ManagerDecision"
+    },
+    "ManagerDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.manager_decision.decision",
+          "StringEquals": "REJECTED",
+          "Next": "RejectByManager"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.manager_decision.decision",
+              "StringEquals": "APPROVED"
+            },
+            {
+              "Variable": "$.request.requires_hr",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "NotifyHR"
+        },
+        {
+          "Variable": "$.manager_decision.decision",
+          "StringEquals": "APPROVED",
+          "Next": "FinalApprove"
+        }
+      ],
+      "Default": "RejectSystemError"
+    },
+    "NotifyHR": {
+      "Type": "Task",
+      "Comment": "Leave longer than the threshold: HR Admin must also approve.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${NotifyApproverFunctionArn}",
+        "Payload": {
+          "taskToken.$": "$$.Task.Token",
+          "request.$": "$.request",
+          "level": "HR",
+          "timeout_seconds.$": "$.config.approval_timeout_seconds"
+        }
+      },
+      "TimeoutSecondsPath": "$.config.approval_timeout_seconds",
+      "ResultPath": "$.hr_decision",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectTimeout"
+        },
+        {
+          "ErrorEquals": [
+            "RequestNotPendingError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RequestNoLongerPending"
+        },
+        {
+          "ErrorEquals": [
+            "NoApproverError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectNoApprover"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectSystemError"
+        }
+      ],
+      "Next": "HRDecision"
+    },
+    "EscalateToHR": {
+      "Type": "Task",
+      "Comment": "Manager did not respond within the timeout (48h by default): HR Admin decides instead.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${NotifyApproverFunctionArn}",
+        "Payload": {
+          "taskToken.$": "$$.Task.Token",
+          "request.$": "$.request",
+          "level": "ESCALATION",
+          "timeout_seconds.$": "$.config.approval_timeout_seconds"
+        }
+      },
+      "TimeoutSecondsPath": "$.config.approval_timeout_seconds",
+      "ResultPath": "$.hr_decision",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectTimeout"
+        },
+        {
+          "ErrorEquals": [
+            "RequestNotPendingError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RequestNoLongerPending"
+        },
+        {
+          "ErrorEquals": [
+            "NoApproverError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectNoApprover"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectSystemError"
+        }
+      ],
+      "Next": "HRDecision"
+    },
+    "HRDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.hr_decision.decision",
+          "StringEquals": "REJECTED",
+          "Next": "RejectByHR"
+        },
+        {
+          "Variable": "$.hr_decision.decision",
+          "StringEquals": "APPROVED",
+          "Next": "FinalApprove"
+        }
+      ],
+      "Default": "RejectSystemError"
+    },
+    "FinalApprove": {
+      "Type": "Task",
+      "Comment": "Atomic DynamoDB transaction: mark APPROVED and deduct the balance (only place balance is deducted).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FinalApproveFunctionArn}",
+        "Payload": {
+          "request.$": "$.request"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "BalanceChangedError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectBalanceChanged"
+        },
+        {
+          "ErrorEquals": [
+            "RequestNotPendingError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RequestNoLongerPending"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "RejectSystemError"
+        }
+      ],
+      "Next": "Approved"
+    },
+    "RejectByManager": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RejectFunctionArn}",
+        "Payload": {
+          "request.$": "$.request",
+          "stage": "MANAGER",
+          "decision.$": "$.manager_decision"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "Rejected"
+    },
+    "RejectByHR": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RejectFunctionArn}",
+        "Payload": {
+          "request.$": "$.request",
+          "stage": "HR",
+          "decision.$": "$.hr_decision"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "Rejected"
+    },
+    "RejectTimeout": {
+      "Type": "Task",
+      "Comment": "Nobody decided in time (HR did not respond after escalation or at the HR step).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RejectFunctionArn}",
+        "Payload": {
+          "request.$": "$.request",
+          "stage": "TIMEOUT",
+          "details.$": "$"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "Rejected"
+    },
+    "RejectBalanceChanged": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RejectFunctionArn}",
+        "Payload": {
+          "request.$": "$.request",
+          "stage": "BALANCE",
+          "details.$": "$"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "Rejected"
+    },
+    "RejectSystemError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RejectFunctionArn}",
+        "Payload": {
+          "request.$": "$.request",
+          "stage": "SYSTEM",
+          "details.$": "$"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "Rejected"
+    },
+    "RejectNoApprover": {
+      "Type": "Task",
+      "Comment": "No approver could be found or notified (e.g. no manager email, or no other HR Admin).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RejectFunctionArn}",
+        "Payload": {
+          "request.$": "$.request",
+          "stage": "NO_APPROVER",
+          "details.$": "$"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.final",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "WorkflowFailed"
+        }
+      ],
+      "Next": "Rejected"
+    },
+    "Approved": {
+      "Type": "Succeed"
+    },
+    "Rejected": {
+      "Type": "Succeed"
+    },
+    "RequestNoLongerPending": {
+      "Type": "Succeed",
+      "Comment": "Request was already finalised elsewhere; nothing to do."
+    },
+    "WorkflowFailed": {
+      "Type": "Fail",
+      "Error": "WorkflowFailed",
+      "Cause": "Could not record the rejection. Check the Reject Lambda logs."
+    }
+  }
+}

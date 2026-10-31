@@ -1,0 +1,2 @@
+# boto3/botocore are provided by the AWS Lambda Python runtime.
+# No extra packages are needed.
